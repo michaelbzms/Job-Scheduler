@@ -97,4 +97,3 @@ void *thread_code(void *args) {
     }
     pthread_exit((void *) 0);
 }
-

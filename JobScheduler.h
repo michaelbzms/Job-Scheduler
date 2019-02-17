@@ -13,7 +13,7 @@ using namespace std;
 class Job {                                  // extend this to whatever job you want scheduled (in a different .cpp/.h)
 public:
     virtual ~Job() {}
-    virtual bool run() = 0;                  // must be thread_safe
+    virtual void run() = 0;                  // must be thread_safe
 };
 
 
@@ -52,4 +52,3 @@ public:
 };
 
 #endif
-
