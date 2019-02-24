@@ -35,7 +35,6 @@ JobScheduler::~JobScheduler() {
 
 void JobScheduler::schedule(Job *job) {
     CHECK_PERROR(pthread_mutex_lock(&queue_lock), "pthread_mutex_lock failed", )
-    bool wasEmpty = job_queue.empty();
     if (job->TAG != NOTAG){
         auto it = tagged_jobs_pending.find(job->TAG);
         if (it == tagged_jobs_pending.end()) tagged_jobs_pending.insert(make_pair(job->TAG, 1));
