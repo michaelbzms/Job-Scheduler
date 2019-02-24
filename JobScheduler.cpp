@@ -12,7 +12,7 @@ JobScheduler::JobScheduler(unsigned int _number_of_threads) : jobs_running(0), n
     CHECK_PERROR(pthread_mutex_init(&queue_lock, NULL), "pthread_mutex_t_init failed",)
     CHECK_PERROR(pthread_cond_init(&queue_cond, NULL), "pthread_cond_init failed",)
     CHECK_PERROR(pthread_cond_init(&jobs_finished_cond, NULL), "pthread_cond_init failed",)
-    t_args = new struct thread_args(&job_queue, &queue_lock, &queue_cond, &jobs_running, &threads_must_exit, &jobs_finished_cond);
+    t_args = new struct thread_args(&job_queue, &queue_lock, &queue_cond, &jobs_running, &threads_must_exit, &jobs_finished_cond, &tagged_jobs_pending);
     threads = new pthread_t[number_of_threads];
     for (int i = 0; i < number_of_threads; i++) {
         CHECK_PERROR(pthread_create(&threads[i], NULL, thread_code, (void *) t_args), "pthread_create failed", threads[i] = 0;)
@@ -20,7 +20,7 @@ JobScheduler::JobScheduler(unsigned int _number_of_threads) : jobs_running(0), n
 }
 
 JobScheduler::~JobScheduler() {
-    waitUntilAllJobsHaveFinished();     // (!) important
+    waitUntilJobsHaveFinished();     // (!) important
     delete t_args;
     threads_must_exit = true;
     CHECK_PERROR(pthread_cond_broadcast(&queue_cond), "pthread_broadcast failed", )
@@ -36,27 +36,52 @@ JobScheduler::~JobScheduler() {
 void JobScheduler::schedule(Job *job) {
     CHECK_PERROR(pthread_mutex_lock(&queue_lock), "pthread_mutex_lock failed", )
     bool wasEmpty = job_queue.empty();
-    job_queue.push(job);
-    if (wasEmpty) {                     // wake up one blocked thread to pick up this job
-        CHECK_PERROR(pthread_cond_signal(&queue_cond), "pthread_cond_signal failed", )
+    if (job->TAG != NOTAG){
+        auto it = tagged_jobs_pending.find(job->TAG);
+        if (it == tagged_jobs_pending.end()) tagged_jobs_pending.insert(make_pair(job->TAG, 1));
+        else (it->second)++;
     }
+    job_queue.push(job);
+    CHECK_PERROR(pthread_cond_signal(&queue_cond), "pthread_cond_signal failed", )
     CHECK_PERROR(pthread_mutex_unlock(&queue_lock), "pthread_mutex_unlock failed", )
 }
 
-bool JobScheduler::allJobsHaveFinished() {
+bool JobScheduler::JobsHaveFinished(int tag) {
     bool result;
-    CHECK_PERROR(pthread_mutex_lock(&queue_lock), "pthread_mutex_lock failed", )
-    result = job_queue.empty() && jobs_running == 0;
-    CHECK_PERROR(pthread_mutex_unlock(&queue_lock), "pthread_mutex_unlock failed", )
+    if (tag == NOTAG){
+        CHECK_PERROR(pthread_mutex_lock(&queue_lock), "pthread_mutex_lock failed", )
+        result = job_queue.empty() && jobs_running == 0;
+        CHECK_PERROR(pthread_mutex_unlock(&queue_lock), "pthread_mutex_unlock failed", )
+    } else {
+        CHECK_PERROR(pthread_mutex_lock(&queue_lock), "pthread_mutex_lock failed", )
+        auto it = tagged_jobs_pending.find(tag);
+        if (it != tagged_jobs_pending.end()){
+            result = it->second == 0;
+        } else {
+            result = true;
+        }
+        CHECK_PERROR(pthread_mutex_unlock(&queue_lock), "pthread_mutex_unlock failed", )
+    }
     return result;
 }
 
-void JobScheduler::waitUntilAllJobsHaveFinished() {
-    CHECK_PERROR(pthread_mutex_lock(&queue_lock), "pthread_mutex_lock failed", )
-    while (!job_queue.empty() || jobs_running > 0){
-        CHECK_PERROR(pthread_cond_wait(&jobs_finished_cond, &queue_lock) , "pthread_cond_wait failed", )
+void JobScheduler::waitUntilJobsHaveFinished(int tag) {
+    if (tag == NOTAG){
+        CHECK_PERROR(pthread_mutex_lock(&queue_lock), "pthread_mutex_lock failed", )
+        while (!job_queue.empty() || jobs_running > 0){
+            CHECK_PERROR(pthread_cond_wait(&jobs_finished_cond, &queue_lock) , "pthread_cond_wait failed", )
+        }
+        CHECK_PERROR(pthread_mutex_unlock(&queue_lock), "pthread_mutex_unlock failed", )
+    } else {
+        CHECK_PERROR(pthread_mutex_lock(&queue_lock), "pthread_mutex_lock failed", )
+        auto it = tagged_jobs_pending.find(tag);
+        if (it != tagged_jobs_pending.end()){
+            while (it->second > 0){
+                CHECK_PERROR(pthread_cond_wait(&jobs_finished_cond, &queue_lock) , "pthread_cond_wait failed", )
+            }
+        }
+        CHECK_PERROR(pthread_mutex_unlock(&queue_lock), "pthread_mutex_unlock failed", )
     }
-    CHECK_PERROR(pthread_mutex_unlock(&queue_lock), "pthread_mutex_unlock failed", )
 }
 
 
@@ -69,9 +94,11 @@ void *thread_code(void *args) {
     volatile unsigned int *jobs_running_ptr = argptr->jobsRunning;
     volatile bool *threads_must_exit_ptr = argptr->threads_must_exit;
     pthread_cond_t *jobs_finished_cond_ptr = argptr->jobs_finished_cond;
+    unordered_map<int, volatile unsigned int> *tagged_jobs_pending_ptr = argptr->tagged_jobs_pending;
 
     while (!(*threads_must_exit_ptr)) {
         Job *job;
+        int tag;
 
         CHECK_PERROR(pthread_mutex_lock(queue_lock), "pthread_mutex_lock failed", continue; )
         while (job_queue->empty() && !(*threads_must_exit_ptr)){
@@ -86,13 +113,19 @@ void *thread_code(void *args) {
         (*jobs_running_ptr)++;
         CHECK_PERROR(pthread_mutex_unlock(queue_lock), "pthread_mutex_unlock failed", )
 
-        job->run();
+        tag = job->TAG;
+        job->run();        
         delete job;                     // (!) scheduler deletes scheduled objects when done but they must be allocated before they get scheduled
 
         CHECK_PERROR(pthread_mutex_lock(queue_lock), "pthread_mutex_lock failed", )
+        int num = 0;
+        if (job->TAG != NOTAG){
+            num = --(*tagged_jobs_pending_ptr)[job->TAG];
+        }
         (*jobs_running_ptr)--;
-
-        CHECK_PERROR(pthread_cond_signal(jobs_finished_cond_ptr), "pthread_cond_signal failed", )
+        if ( num == 0 || (*jobs_running_ptr) == 0 ){
+            CHECK_PERROR(pthread_cond_broadcast(jobs_finished_cond_ptr), "pthread_cond_signal failed", )
+        }
         CHECK_PERROR(pthread_mutex_unlock(queue_lock), "pthread_mutex_unlock failed", )
     }
     pthread_exit((void *) 0);
